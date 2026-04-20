@@ -454,6 +454,73 @@ class TestAdvanceNextRun:
         assert len(due_after) == 0, "Job should not be due after advance_next_run"
 
 
+class TestConcurrentJobsJsonRMW:
+    """Verify _JOBS_RMW_LOCK serializes read-modify-write cycles.
+
+    After scheduler.tick() was rewritten to dispatch jobs to a worker
+    thread, the dispatcher keeps calling advance_next_run while the worker
+    calls mark_job_run — two threads now race on the same jobs.json
+    read-modify-write pattern. Without serialization, one save() wins and
+    the other thread's mutation is silently dropped.
+    """
+
+    def test_no_updates_lost_under_concurrent_rmw(self, tmp_cron_dir):
+        """Concurrent mark_job_run on job A + advance_next_run on job B must keep both updates."""
+        import threading
+        from cron.jobs import create_job, mark_job_run, advance_next_run, load_jobs, save_jobs
+
+        # Two recurring jobs, both stale so advance_next_run will mutate them.
+        job_a = create_job(prompt="A", schedule="every 1h")
+        job_b = create_job(prompt="B", schedule="every 1h")
+        jobs = load_jobs()
+        past = (datetime.now() - timedelta(minutes=30)).isoformat()
+        for j in jobs:
+            j["next_run_at"] = past
+        save_jobs(jobs)
+
+        # Fire many concurrent pairs. Without the lock, at least one run's
+        # mutation would be lost ~always under contention.
+        ITERATIONS = 40
+        errors: list[str] = []
+
+        def worker_mark(i):
+            try:
+                mark_job_run(job_a["id"], success=True, error=None)
+            except Exception as e:
+                errors.append(f"mark[{i}]: {e}")
+
+        def worker_advance(i):
+            try:
+                advance_next_run(job_b["id"])
+            except Exception as e:
+                errors.append(f"advance[{i}]: {e}")
+
+        threads: list[threading.Thread] = []
+        for i in range(ITERATIONS):
+            threads.append(threading.Thread(target=worker_mark, args=(i,)))
+            threads.append(threading.Thread(target=worker_advance, args=(i,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Worker errors: {errors[:5]}"
+
+        # Final state: job A has been marked ok (last_run_at not None);
+        # job B has next_run_at in the future. If the lock failed, one of
+        # these would still be at its pre-concurrency state.
+        final = load_jobs()
+        final_a = next(j for j in final if j["id"] == job_a["id"])
+        final_b = next(j for j in final if j["id"] == job_b["id"])
+
+        assert final_a.get("last_run_at") is not None, "job A mark_job_run was lost to a race"
+        assert final_a.get("last_status") == "ok"
+
+        from cron.jobs import _ensure_aware, _hermes_now
+        b_next_dt = _ensure_aware(datetime.fromisoformat(final_b["next_run_at"]))
+        assert b_next_dt > _hermes_now(), "job B advance_next_run was lost to a race"
+
+
 class TestGetDueJobs:
     def test_past_due_within_window_returned(self, tmp_cron_dir):
         """Jobs within the dynamic grace window are still considered due (not stale).

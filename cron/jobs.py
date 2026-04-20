@@ -11,11 +11,21 @@ import logging
 import tempfile
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
+
+# In-process lock protecting read-modify-write cycles on jobs.json (mark_job_run,
+# advance_next_run, schedule mutators).  Needed because scheduler.tick() now
+# dispatches jobs to a worker thread while continuing to advance next_run_at on
+# the dispatcher thread — without this lock, dispatcher and worker can both
+# load jobs.json, each mutate a different job, and race each other's save.
+# Cross-process writes are still protected by save_jobs()'s atomic
+# tempfile+rename; this lock only dedupes the in-process RMW pattern.
+_JOBS_RMW_LOCK = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -594,43 +604,44 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
-    jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] == job_id:
-            now = _hermes_now().isoformat()
-            job["last_run_at"] = now
-            job["last_status"] = "ok" if success else "error"
-            job["last_error"] = error if not success else None
-            # Track delivery failures separately — cleared on successful delivery
-            job["last_delivery_error"] = delivery_error
-            
-            # Increment completed count
-            if job.get("repeat"):
-                job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                
-                # Check if we've hit the repeat limit
-                times = job["repeat"].get("times")
-                completed = job["repeat"]["completed"]
-                if times is not None and times > 0 and completed >= times:
-                    # Remove the job (limit reached)
-                    jobs.pop(i)
-                    save_jobs(jobs)
-                    return
-            
-            # Compute next run
-            job["next_run_at"] = compute_next_run(job["schedule"], now)
+    with _JOBS_RMW_LOCK:
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                now = _hermes_now().isoformat()
+                job["last_run_at"] = now
+                job["last_status"] = "ok" if success else "error"
+                job["last_error"] = error if not success else None
+                # Track delivery failures separately — cleared on successful delivery
+                job["last_delivery_error"] = delivery_error
 
-            # If no next run (one-shot completed), disable
-            if job["next_run_at"] is None:
-                job["enabled"] = False
-                job["state"] = "completed"
-            elif job.get("state") != "paused":
-                job["state"] = "scheduled"
+                # Increment completed count
+                if job.get("repeat"):
+                    job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
 
-            save_jobs(jobs)
-            return
+                    # Check if we've hit the repeat limit
+                    times = job["repeat"].get("times")
+                    completed = job["repeat"]["completed"]
+                    if times is not None and times > 0 and completed >= times:
+                        # Remove the job (limit reached)
+                        jobs.pop(i)
+                        save_jobs(jobs)
+                        return
 
-    logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+                # Compute next run
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                # If no next run (one-shot completed), disable
+                if job["next_run_at"] is None:
+                    job["enabled"] = False
+                    job["state"] = "completed"
+                elif job.get("state") != "paused":
+                    job["state"] = "scheduled"
+
+                save_jobs(jobs)
+                return
+
+        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -645,20 +656,21 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    jobs = load_jobs()
-    for job in jobs:
-        if job["id"] == job_id:
-            kind = job.get("schedule", {}).get("kind")
-            if kind not in ("cron", "interval"):
+    with _JOBS_RMW_LOCK:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                kind = job.get("schedule", {}).get("kind")
+                if kind not in ("cron", "interval"):
+                    return False
+                now = _hermes_now().isoformat()
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    save_jobs(jobs)
+                    return True
                 return False
-            now = _hermes_now().isoformat()
-            new_next = compute_next_run(job["schedule"], now)
-            if new_next and new_next != job.get("next_run_at"):
-                job["next_run_at"] = new_next
-                save_jobs(jobs)
-                return True
-            return False
-    return False
+        return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
