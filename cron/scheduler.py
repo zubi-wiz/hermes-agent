@@ -63,6 +63,20 @@ _hermes_home = get_hermes_home()
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
+# Dispatch pool — tick() submits due jobs here and returns immediately.
+# A long-running LLM agent no longer holds the file lock or blocks subsequent
+# ticks, so once-scheduled jobs (e.g. force-fired Mendi reviews) can fire on
+# time even while another cron is mid-agent-turn. max_workers=1 keeps
+# jobs.json mutations serialized (mark_job_run/advance_next_run read-modify-
+# write the file) — bump only after those paths gain their own lock.
+import atexit as _atexit
+
+_DISPATCH_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="hermes-cron-worker",
+)
+_atexit.register(_DISPATCH_POOL.shutdown, wait=False, cancel_futures=True)
+
 
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata."""
@@ -906,20 +920,93 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+def _run_and_finalize(job: dict, adapters=None, loop=None, verbose: bool = True) -> None:
     """
-    Check and run all due jobs.
-    
-    Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
-    
+    Execute a single job, deliver its output, and mark it run.
+
+    Runs in a worker thread dispatched from tick() so tick() can return
+    promptly. All exceptions are caught and recorded via mark_job_run so a
+    worker crash never leaks into the dispatch pool.
+    """
+    try:
+        success, output, final_response, error = run_job(job)
+
+        output_file = save_job_output(job["id"], output)
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        # Deliver the final response to the origin/target chat.
+        # If the agent responded with [SILENT], skip delivery (but
+        # output is already saved above).  Failed jobs always deliver.
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+        should_deliver = bool(deliver_content)
+        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+        # Treat empty final_response as a soft failure so last_status
+        # is not "ok" — the agent ran but produced nothing useful.
+        # (issue #8585)
+        if success and not final_response:
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job.get("id", "?"), e)
+        try:
+            mark_job_run(job["id"], False, str(e))
+        except Exception as mark_err:
+            logger.error("Also failed to mark_job_run for %s: %s", job.get("id", "?"), mark_err)
+
+
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    _wait_for_completion: bool = False,
+) -> int:
+    """
+    Dispatch all due jobs to the worker pool and return promptly.
+
+    Prior behaviour held a file lock across each job's full execution, which
+    could be 3-10 min for LLM agent crons. During that window, the 60s-periodic
+    gateway ticker skipped (lock held) and once-scheduled jobs whose run_at
+    fell inside the window starved until the current job finished. This caused
+    routine 30-40 min delays on force-fired Mendi reviews.
+
+    Now tick() holds the file lock only across dispatch (microseconds), hands
+    each due job to `_DISPATCH_POOL`, and returns. The worker pool runs jobs
+    serially (max_workers=1) so jobs.json mutations stay serialized — but the
+    scheduler itself is unblocked, so new due jobs always fire on time.
+
+    Cross-process safety: the file lock still guards dispatch against overlap
+    between the gateway in-process ticker and a standalone daemon / manual
+    `hermes cron tick`. Within-process duplicate-dispatch is prevented by
+    `advance_next_run(job_id)` being called before submit, which moves the
+    job's next_run_at past the current tick window.
+
     Args:
-        verbose: Whether to print status messages
-        adapters: Optional dict mapping Platform → live adapter (from gateway)
-        loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+        verbose: Whether to print status messages.
+        adapters: Optional dict mapping Platform → live adapter (from gateway).
+        loop: Optional asyncio event loop (from gateway) for live adapter sends.
+        _wait_for_completion: If True, block until all jobs dispatched by this
+            call have finished. Intended for tests and scripted single-job
+            workflows — do NOT set True from the gateway ticker or the head-
+            of-line bug returns.
+
     Returns:
-        Number of jobs executed (0 if another tick is already running)
+        Number of jobs dispatched this tick (0 if another tick is already
+        running or no jobs are due). Dispatched, not completed — use
+        _wait_for_completion=True if you need completion semantics.
     """
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -937,6 +1024,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             lock_fd.close()
         return 0
 
+    dispatched_futures: list[concurrent.futures.Future] = []
     try:
         due_jobs = get_due_jobs()
 
@@ -954,44 +1042,22 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # next future occurrence BEFORE execution.  This way, if the
                 # process crashes mid-run, the job won't re-fire on restart.
                 # One-shot jobs are left alone so they can retry on restart.
+                # Also: advancing before dispatch prevents the NEXT tick from
+                # re-dispatching this job while the worker is still running.
                 advance_next_run(job["id"])
 
-                success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response:
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                future = _DISPATCH_POOL.submit(
+                    _run_and_finalize, job, adapters, loop, verbose
+                )
+                dispatched_futures.append(future)
                 executed += 1
 
             except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
+                logger.error("Error dispatching job %s: %s", job.get("id", "?"), e)
+                try:
+                    mark_job_run(job["id"], False, str(e))
+                except Exception as mark_err:
+                    logger.error("Also failed to mark_job_run for %s: %s", job.get("id", "?"), mark_err)
 
         return executed
     finally:
@@ -1003,6 +1069,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             except (OSError, IOError):
                 pass
         lock_fd.close()
+
+        # Waiting happens OUTSIDE the file lock so holding the lock while
+        # a 10-min LLM call runs never recurs even with this opt-in.
+        if _wait_for_completion and dispatched_futures:
+            concurrent.futures.wait(dispatched_futures)
 
 
 if __name__ == "__main__":

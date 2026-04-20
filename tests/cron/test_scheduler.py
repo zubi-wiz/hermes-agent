@@ -742,7 +742,7 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
 
         # Should be called with success=False because final_response is empty
         mock_mark.assert_called_once()
@@ -1135,7 +1135,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_called_once()
 
     def test_silent_response_suppresses_delivery(self, caplog):
@@ -1146,7 +1146,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
@@ -1157,7 +1157,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_silent_trailing_suppresses_delivery(self):
@@ -1169,7 +1169,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
@@ -1179,7 +1179,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_failed_job_always_delivers(self):
@@ -1190,18 +1190,25 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_called_once()
 
-    def test_output_saved_even_when_delivery_suppressed(self):
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+    def test_output_saved_even_when_delivery_suppressed(self, tmp_path):
+        # Patch _hermes_home / lock paths so the tick file lock lives in an
+        # isolated tmp dir — shared-path contention under pytest-xdist caused
+        # this test to flake when other cron tests ran concurrently.
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output") as save_mock, \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             save_mock.return_value = "/tmp/out.md"
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
@@ -1307,12 +1314,70 @@ class TestTickAdvanceBeforeRun:
              patch("cron.scheduler.mark_job_run"), \
              patch("cron.scheduler._deliver_result"):
             from cron.scheduler import tick
-            executed = tick(verbose=False)
+            executed = tick(verbose=False, _wait_for_completion=True)
 
         assert executed == 1
         adv_mock.assert_called_once_with("test-advance")
         # advance must happen before run
         assert call_order == [("advance", "test-advance"), ("run", "test-advance")]
+
+
+class TestNonBlockingTick:
+    """Regression tests for head-of-line blocking fix.
+
+    Prior behaviour held the tick file lock across run_job (3-10 min for LLM
+    agent crons), starving once-scheduled jobs. Dispatch now runs inside the
+    file lock; execution runs on a worker thread outside it.
+    """
+
+    def test_tick_returns_before_run_job_completes(self, tmp_path):
+        """tick() must return before run_job finishes when caller doesn't wait."""
+        import threading
+        import time
+
+        run_job_started = threading.Event()
+        run_job_release = threading.Event()
+
+        def slow_run_job(job):
+            run_job_started.set()
+            # Block until the test explicitly releases us.
+            assert run_job_release.wait(timeout=5.0), "test harness did not release slow_run_job"
+            return True, "output", "response", None
+
+        fake_job = {
+            "id": "slow-job",
+            "name": "slow",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job", side_effect=slow_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
+            from cron.scheduler import tick
+
+            start = time.monotonic()
+            executed = tick(verbose=False)
+            tick_elapsed = time.monotonic() - start
+
+            try:
+                # tick should have returned very quickly — certainly before
+                # the worker finishes, since the worker is still blocked on
+                # the release event.
+                assert tick_elapsed < 1.0, (
+                    f"tick took {tick_elapsed:.2f}s — head-of-line blocking regressed"
+                )
+                assert executed == 1
+                # Worker should have started even though tick returned.
+                assert run_job_started.wait(timeout=2.0), "worker thread never started"
+            finally:
+                # Always release the worker so the pool doesn't leak a blocked thread.
+                run_job_release.set()
 
 
 class TestSendMediaViaAdapter:
