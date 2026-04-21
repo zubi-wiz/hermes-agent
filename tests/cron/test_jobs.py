@@ -619,6 +619,99 @@ class TestConcurrentJobsJsonRMW:
             )
 
 
+class TestMutationPathsWrappedInTransaction:
+    """Regression for Mendi R2 Finding: create_job / update_job / remove_job
+    must also hold jobs_transaction so their load-modify-save cycles don't
+    race with concurrent mark_job_run / advance_next_run / reserve_for_dispatch.
+
+    Mendi's deterministic repro: update_job loaded stale state, mark_job_run
+    saved, update_job saved stale → final job lost last_run_at + last_status.
+    This test reproduces the shape with concurrent threads and asserts both
+    mutations survive.
+    """
+
+    def test_update_job_and_mark_job_run_dont_clobber(self, tmp_cron_dir):
+        import threading
+        from cron.jobs import create_job, update_job, mark_job_run, load_jobs
+
+        job = create_job(prompt="R", schedule="every 1h")
+        errors: list[str] = []
+
+        def hammer_update():
+            try:
+                for _ in range(100):
+                    update_job(job["id"], {"name": f"renamed-{_}"})
+            except Exception as e:
+                errors.append(f"update: {e}")
+
+        def hammer_mark():
+            try:
+                for _ in range(100):
+                    mark_job_run(job["id"], success=True, error=None)
+            except Exception as e:
+                errors.append(f"mark: {e}")
+
+        t1 = threading.Thread(target=hammer_update)
+        t2 = threading.Thread(target=hammer_mark)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert not errors, f"Worker errors: {errors[:3]}"
+
+        final = load_jobs()
+        final_job = next(j for j in final if j["id"] == job["id"])
+        # Both last_run_at (from mark_job_run) and a rename (from update_job)
+        # must survive. If one path clobbered the other, one field would
+        # still be at its pre-concurrency default.
+        assert final_job.get("last_run_at") is not None, (
+            "mark_job_run was clobbered by concurrent update_job"
+        )
+        assert final_job.get("last_status") == "ok"
+        assert final_job.get("name", "").startswith("renamed-"), (
+            "update_job was clobbered by concurrent mark_job_run"
+        )
+
+    def test_create_job_and_remove_job_are_atomic(self, tmp_cron_dir):
+        """Concurrent create_job + remove_job don't leave the file in an
+        inconsistent state (e.g. half-written additions, orphan entries)."""
+        import threading
+        from cron.jobs import create_job, remove_job, load_jobs
+
+        created_ids: list[str] = []
+        create_lock = threading.Lock()
+
+        def hammer_create():
+            for _ in range(30):
+                j = create_job(prompt=f"c-{_}", schedule="every 1h")
+                with create_lock:
+                    created_ids.append(j["id"])
+
+        def hammer_remove():
+            # Remove some fraction of what gets created
+            for _ in range(60):
+                with create_lock:
+                    target = created_ids[-1] if created_ids else None
+                if target:
+                    remove_job(target)
+
+        t1 = threading.Thread(target=hammer_create)
+        t2 = threading.Thread(target=hammer_remove)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        # jobs.json must still load cleanly — no partial writes, no corrupt
+        # state.  (If the lock failed, save_jobs's atomic rename still
+        # prevents half-written files, but a stale-overwrite could leave
+        # phantom "already deleted" entries lingering.)
+        final = load_jobs()
+        final_ids = {j["id"] for j in final}
+        # Every remaining entry must be one that was created (no corrupt
+        # orphan entries).
+        assert final_ids.issubset(set(created_ids)), (
+            "remaining entries are not a subset of created — state corrupted"
+        )
+
+
 class TestReserveForDispatch:
     """Tests for reserve_for_dispatch — unified dispatch-claim across kinds."""
 
