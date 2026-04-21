@@ -6,6 +6,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
 import copy
+import contextlib
 import json
 import logging
 import tempfile
@@ -18,14 +19,29 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
 
-# In-process lock protecting read-modify-write cycles on jobs.json (mark_job_run,
-# advance_next_run, schedule mutators).  Needed because scheduler.tick() now
-# dispatches jobs to a worker thread while continuing to advance next_run_at on
-# the dispatcher thread — without this lock, dispatcher and worker can both
-# load jobs.json, each mutate a different job, and race each other's save.
-# Cross-process writes are still protected by save_jobs()'s atomic
-# tempfile+rename; this lock only dedupes the in-process RMW pattern.
-_JOBS_RMW_LOCK = threading.Lock()
+# fcntl is Unix-only; on Windows use msvcrt for file locking.  Same pattern as
+# scheduler._tick_lock, but guarding a different resource (jobs.json RMW
+# cycles, not tick execution).
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        _msvcrt = None
+else:
+    _msvcrt = None
+
+# Stale-lease window for once-scheduled jobs' dispatch claim.  When tick()
+# reserves a once-job for dispatch, it bumps next_run_at this far into the
+# future.  If the worker succeeds, mark_job_run() disables the job before the
+# lease expires.  If the worker / process crashes, the job becomes due again
+# after this window — so the user's force-fire is retried automatically rather
+# than being silently lost.  30 min is long enough to cover any realistic LLM
+# agent turn plus delivery, and short enough that a crashed force-fire retries
+# same-session.
+DISPATCH_STALE_LEASE_SECONDS = 1800
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +61,80 @@ HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
 OUTPUT_DIR = CRON_DIR / "output"
+JOBS_LOCK_FILE = CRON_DIR / ".jobs.lock"
 ONESHOT_GRACE_SECONDS = 120
+
+
+# =============================================================================
+# Cross-process jobs.json transaction lock
+# =============================================================================
+#
+# Every read-modify-write path on jobs.json (mark_job_run, advance_next_run,
+# reserve_for_dispatch, get_due_jobs' fast-forward save, and scheduler.tick()'s
+# dispatch claim) must serialize through this lock.  Otherwise two actors —
+# two processes (gateway + standalone daemon + manual CLI tick) OR two threads
+# (tick dispatcher + worker finalize) — can load jobs.json, each mutate a
+# different job, and race their save: second save overwrites first, silently
+# dropping one mutation.
+#
+# Scope discipline: hold for microseconds to milliseconds per RMW cycle.  Do
+# NOT hold across run_job() or any LLM-latency path — that would recreate the
+# head-of-line blocking class this fix closes.
+#
+# Re-entrancy: nest-safe within a single thread via a thread-local counter.
+# The same thread can enter jobs_transaction() recursively (tick → reserve →
+# ...) without deadlocking.  Re-entry by a DIFFERENT thread of the same
+# process blocks on the file lock until the holding thread's outermost
+# transaction exits — correct serialization for our dispatcher-vs-worker
+# case.
+
+_jobs_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def jobs_transaction():
+    """Cross-process exclusive lock for a jobs.json RMW cycle.
+
+    Blocking acquire (waits for turn) — do not use with NB semantics.  Holds
+    an fcntl/msvcrt exclusive lock on ``JOBS_LOCK_FILE``, plus a thread-local
+    counter for nested re-entry.
+    """
+    depth = getattr(_jobs_lock_state, "depth", 0)
+    if depth > 0:
+        _jobs_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _jobs_lock_state.depth -= 1
+        return
+
+    # Outermost entry — actually acquire the file lock.
+    JOBS_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(JOBS_LOCK_FILE, "w")
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        elif _msvcrt is not None:
+            _msvcrt.locking(lock_fd.fileno(), _msvcrt.LK_LOCK, 1)
+        # else: platform has no file-locking primitive — fall through.  Tests
+        # on such platforms will lose cross-process safety but keep the in-
+        # process thread-local ordering via the counter, which is better than
+        # nothing.  Real production runs on Unix/macOS with fcntl.
+
+        _jobs_lock_state.depth = 1
+        try:
+            yield
+        finally:
+            _jobs_lock_state.depth = 0
+    finally:
+        if _fcntl is not None:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            try:
+                _msvcrt.locking(lock_fd.fileno(), _msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+        lock_fd.close()
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -604,7 +693,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
-    with _JOBS_RMW_LOCK:
+    with jobs_transaction():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
@@ -614,6 +703,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                # Clear the dispatch-claim lease set by reserve_for_dispatch()
+                # so that if the schedule replays this job at some future
+                # point, the in_flight_until field doesn't linger.
+                job.pop("in_flight_until", None)
 
                 # Increment completed count
                 if job.get("repeat"):
@@ -656,7 +749,7 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    with _JOBS_RMW_LOCK:
+    with jobs_transaction():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
@@ -673,6 +766,60 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def reserve_for_dispatch(job_id: str,
+                         stale_lease_seconds: int = DISPATCH_STALE_LEASE_SECONDS) -> bool:
+    """Claim a job for dispatch so the next tick won't re-dispatch it.
+
+    Unified across recurring and once-scheduled jobs.  Called by
+    ``scheduler.tick()`` under ``jobs_transaction()`` after ``get_due_jobs()``
+    returns a job and before the worker is submitted.
+
+    * Recurring jobs (``kind in ("cron", "interval")``): advance ``next_run_at``
+      to the next scheduled occurrence (same semantics as ``advance_next_run``).
+      This keeps the at-most-once guarantee for recurring jobs — if the worker
+      crashes mid-run, the job is skipped and re-fires at its next natural
+      time.
+    * Once-scheduled jobs (``kind == "once"`` or absent): push ``next_run_at``
+      to ``now + stale_lease_seconds`` and set ``in_flight_until`` to the same
+      timestamp.  ``mark_job_run()`` clears ``in_flight_until`` on success
+      (and disables the job as usual).  If the worker / process crashes and
+      never marks the job done, the job becomes due again after the lease
+      expires — so force-fired reviews are retried rather than silently lost.
+
+    Returns True if the job was found and its claim persisted, False
+    otherwise (job_id unknown or no-op).
+    """
+    with jobs_transaction():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            kind = (job.get("schedule") or {}).get("kind")
+            now = _hermes_now()
+            now_iso = now.isoformat()
+
+            if kind in ("cron", "interval"):
+                new_next = compute_next_run(job["schedule"], now_iso)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    # Belt-and-suspenders lease: even for recurring jobs we
+                    # record an in_flight_until so get_due_jobs can filter
+                    # them out if a crash leaves next_run_at somehow stale.
+                    job["in_flight_until"] = (now + timedelta(seconds=stale_lease_seconds)).isoformat()
+                    save_jobs(jobs)
+                    return True
+                return False
+
+            # kind == "once" or missing — push the dispatch lease
+            lease_until = (now + timedelta(seconds=stale_lease_seconds)).isoformat()
+            job["next_run_at"] = lease_until
+            job["in_flight_until"] = lease_until
+            save_jobs(jobs)
+            return True
+
+        return False
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -680,76 +827,95 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     (more than one period in the past, e.g. because the gateway was down),
     the job is fast-forwarded to the next future run instead of firing
     immediately.  This prevents a burst of missed jobs on gateway restart.
+
+    Jobs with a live ``in_flight_until`` lease (set by
+    ``reserve_for_dispatch``) are excluded — they are already claimed for
+    dispatch by an in-flight worker.  If the lease has expired (worker
+    crashed or machine rebooted), the filter lets the job through so it
+    can be retried.
     """
-    now = _hermes_now()
-    raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
-    needs_save = False
+    with jobs_transaction():
+        now = _hermes_now()
+        raw_jobs = load_jobs()
+        jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+        due = []
+        needs_save = False
 
-    for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            if not recovered_next:
+        for job in jobs:
+            if not job.get("enabled", True):
                 continue
 
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
-                job.get("name", job["id"]),
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
+            # Skip jobs that have an unexpired dispatch lease — another worker
+            # is already running them.  Expired leases (post-crash) fall
+            # through so the job gets another chance.
+            lease = job.get("in_flight_until")
+            if lease:
+                try:
+                    lease_dt = _ensure_aware(datetime.fromisoformat(lease))
+                except (TypeError, ValueError):
+                    lease_dt = None
+                if lease_dt is not None and lease_dt > now:
+                    continue
 
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
+            next_run = job.get("next_run_at")
+            if not next_run:
+                recovered_next = _recoverable_oneshot_run_at(
+                    job.get("schedule", {}),
+                    now,
+                    last_run_at=job.get("last_run_at"),
+                )
+                if not recovered_next:
+                    continue
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
+                job["next_run_at"] = recovered_next
+                next_run = recovered_next
+                logger.info(
+                    "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                    job.get("name", job["id"]),
+                    recovered_next,
+                )
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["next_run_at"] = recovered_next
+                        needs_save = True
+                        break
 
-            due.append(job)
+            next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
+            if next_run_dt <= now:
+                schedule = job.get("schedule", {})
+                kind = schedule.get("kind")
 
-    if needs_save:
-        save_jobs(raw_jobs)
+                # For recurring jobs, check if the scheduled time is stale
+                # (gateway was down and missed the window). Fast-forward to
+                # the next future occurrence instead of firing a stale run.
+                grace = _compute_grace_seconds(schedule)
+                if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                    # Job is past its catch-up grace window — this is a stale missed run.
+                    # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
+                    new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next:
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Fast-forwarding to next run: %s",
+                            job.get("name", job["id"]),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
+                        # Update the job in storage
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        continue  # Skip this run
 
-    return due
+                due.append(job)
+
+        if needs_save:
+            save_jobs(raw_jobs)
+
+        return due
 
 
 def save_job_output(job_id: str, output: str):

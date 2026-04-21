@@ -185,6 +185,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.setattr("cron.jobs.JOBS_LOCK_FILE", tmp_path / "cron" / ".jobs.lock")
     return tmp_path
 
 
@@ -455,17 +456,17 @@ class TestAdvanceNextRun:
 
 
 class TestConcurrentJobsJsonRMW:
-    """Verify _JOBS_RMW_LOCK serializes read-modify-write cycles.
+    """Verify jobs_transaction serializes read-modify-write cycles.
 
     After scheduler.tick() was rewritten to dispatch jobs to a worker
-    thread, the dispatcher keeps calling advance_next_run while the worker
-    calls mark_job_run — two threads now race on the same jobs.json
-    read-modify-write pattern. Without serialization, one save() wins and
-    the other thread's mutation is silently dropped.
+    thread, the dispatcher keeps calling reserve_for_dispatch /
+    advance_next_run while the worker calls mark_job_run. Without
+    serialization, multiple actors can load jobs.json, each mutate a
+    different job, and race their save — second save clobbers first.
     """
 
-    def test_no_updates_lost_under_concurrent_rmw(self, tmp_cron_dir):
-        """Concurrent mark_job_run on job A + advance_next_run on job B must keep both updates."""
+    def test_no_updates_lost_under_concurrent_in_process_rmw(self, tmp_cron_dir):
+        """In-process: concurrent mark_job_run(A) + advance_next_run(B) keep both updates."""
         import threading
         from cron.jobs import create_job, mark_job_run, advance_next_run, load_jobs, save_jobs
 
@@ -519,6 +520,183 @@ class TestConcurrentJobsJsonRMW:
         from cron.jobs import _ensure_aware, _hermes_now
         b_next_dt = _ensure_aware(datetime.fromisoformat(final_b["next_run_at"]))
         assert b_next_dt > _hermes_now(), "job B advance_next_run was lost to a race"
+
+    def test_no_updates_lost_across_processes(self, tmp_path):
+        """Cross-process: two subprocess-level actors running
+        mark_job_run(A) + advance_next_run(B) must both survive the save.
+
+        Regression for Mendi R1 Finding 2. Without a cross-process file
+        lock, the in-process ``threading.Lock`` would not prevent
+        process A's save from clobbering process B's mutation (or vice
+        versa). Uses subprocess to force a second OS process sharing the
+        same HERMES_HOME.
+        """
+        import os as _os
+        import subprocess
+        import sys
+        import textwrap
+        import cron.jobs as jobs_mod
+        from cron.jobs import create_job, load_jobs, save_jobs, mark_job_run, _ensure_aware, _hermes_now
+
+        hermes_home = tmp_path / "xproc_hermes"
+        cron_dir = hermes_home / "cron"
+        cron_dir.mkdir(parents=True)
+
+        # Patch parent's cron.jobs constants to the shared HERMES_HOME so
+        # the subprocess (which uses the HERMES_HOME env var) and the
+        # parent both hit the same jobs.json + .jobs.lock.
+        with patch.object(jobs_mod, "HERMES_DIR", hermes_home), \
+             patch.object(jobs_mod, "CRON_DIR", cron_dir), \
+             patch.object(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json"), \
+             patch.object(jobs_mod, "OUTPUT_DIR", cron_dir / "output"), \
+             patch.object(jobs_mod, "JOBS_LOCK_FILE", cron_dir / ".jobs.lock"):
+
+            # Use recurring jobs so advance_next_run will actually mutate.
+            job_a = create_job(prompt="cross-A", schedule="every 1h")
+            job_b = create_job(prompt="cross-B", schedule="every 1h")
+            jobs = load_jobs()
+            past = (datetime.now() - timedelta(minutes=30)).isoformat()
+            for j in jobs:
+                j["next_run_at"] = past
+            save_jobs(jobs)
+
+            # Subprocess: advance_next_run(B) in a loop while parent
+            # hammers mark_job_run(A) concurrently. Both share the same
+            # jobs.json + jobs.lock via HERMES_HOME.
+            subproc_script = textwrap.dedent(
+                """
+                import sys
+                sys.path.insert(0, %(repo)r)
+                from cron.jobs import advance_next_run
+                for _ in range(200):
+                    advance_next_run(%(jobid)r)
+                print("SUBPROC_DONE")
+                """
+            ) % {
+                "repo": str(jobs_mod.Path(jobs_mod.__file__).parent.parent),
+                "jobid": job_b["id"],
+            }
+
+            env = {**_os.environ, "HERMES_HOME": str(hermes_home)}
+            # Explicit PATH so subprocess Python can find fcntl / msvcrt
+            # standard libs.
+            proc = subprocess.Popen(
+                [sys.executable, "-c", subproc_script],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _ in range(200):
+                    mark_job_run(job_a["id"], success=True, error=None)
+                stdout, stderr = proc.communicate(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
+            assert proc.returncode == 0, (
+                f"subprocess failed rc={proc.returncode} "
+                f"stderr={stderr.decode()[:500]}"
+            )
+            assert b"SUBPROC_DONE" in stdout, (
+                "subprocess did not reach completion marker"
+            )
+
+            final = load_jobs()
+            final_a = next(j for j in final if j["id"] == job_a["id"])
+            final_b = next(j for j in final if j["id"] == job_b["id"])
+
+            assert final_a.get("last_run_at") is not None, (
+                "job A mark_job_run was clobbered by a cross-process "
+                "advance_next_run on B — the jobs file lock failed"
+            )
+            assert final_a.get("last_status") == "ok"
+
+            b_next_dt = _ensure_aware(datetime.fromisoformat(final_b["next_run_at"]))
+            assert b_next_dt > _hermes_now(), (
+                "job B advance_next_run was clobbered by a cross-process "
+                "mark_job_run on A — the jobs file lock failed"
+            )
+
+
+class TestReserveForDispatch:
+    """Tests for reserve_for_dispatch — unified dispatch-claim across kinds."""
+
+    def test_recurring_advances_next_run_at(self, tmp_cron_dir):
+        """Recurring jobs: reserve_for_dispatch behaves like advance_next_run."""
+        from cron.jobs import create_job, reserve_for_dispatch, load_jobs, save_jobs, _ensure_aware, _hermes_now
+
+        job = create_job(prompt="R", schedule="every 1h")
+        jobs = load_jobs()
+        past = (datetime.now() - timedelta(minutes=30)).isoformat()
+        jobs[0]["next_run_at"] = past
+        save_jobs(jobs)
+
+        assert reserve_for_dispatch(job["id"]) is True
+        updated = load_jobs()[0]
+        new_next = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert new_next > _hermes_now(), "recurring next_run_at must advance forward"
+        assert "in_flight_until" in updated, "recurring reservations still set the lease"
+
+    def test_once_sets_dispatch_lease(self, tmp_cron_dir):
+        """Once jobs: reserve_for_dispatch sets next_run_at and
+        in_flight_until to a future lease, preventing re-dispatch by the
+        next tick.
+        """
+        from cron.jobs import create_job, reserve_for_dispatch, load_jobs, save_jobs, _ensure_aware, _hermes_now
+
+        job = create_job(prompt="O", schedule="30m")  # one-shot
+        # Force it due.
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        assert reserve_for_dispatch(job["id"], stale_lease_seconds=1800) is True
+        updated = load_jobs()[0]
+        lease = _ensure_aware(datetime.fromisoformat(updated["in_flight_until"]))
+        next_run = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        now = _hermes_now()
+        assert lease > now, "lease must be in the future"
+        assert next_run == lease, "once-job next_run_at should mirror the lease"
+
+    def test_once_crash_recovery_after_lease(self, tmp_cron_dir):
+        """If a once-job is reserved but the worker never marks it done,
+        the job becomes due again after the lease expires.
+        """
+        from cron.jobs import create_job, reserve_for_dispatch, get_due_jobs, load_jobs, save_jobs
+
+        job = create_job(prompt="O", schedule="30m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        # Reserve with a 1-second lease so we can observe expiry in-test.
+        reserve_for_dispatch(job["id"], stale_lease_seconds=1)
+
+        # Immediately: not due (lease is live).
+        assert all(j["id"] != job["id"] for j in get_due_jobs())
+
+        # After the lease expires, the job becomes due again.
+        import time
+        time.sleep(1.2)
+        assert any(j["id"] == job["id"] for j in get_due_jobs()), (
+            "expired lease must allow retry"
+        )
+
+    def test_mark_job_run_clears_lease(self, tmp_cron_dir):
+        """mark_job_run() clears in_flight_until as part of finalize."""
+        from cron.jobs import create_job, reserve_for_dispatch, mark_job_run, load_jobs, save_jobs
+
+        job = create_job(prompt="R", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=30)).isoformat()
+        save_jobs(jobs)
+
+        reserve_for_dispatch(job["id"])
+        assert "in_flight_until" in load_jobs()[0]
+
+        mark_job_run(job["id"], success=True, error=None)
+        assert "in_flight_until" not in load_jobs()[0]
 
 
 class TestGetDueJobs:

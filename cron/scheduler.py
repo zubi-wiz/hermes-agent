@@ -49,7 +49,14 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "qqbot",
 })
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    reserve_for_dispatch,
+    jobs_transaction,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -985,14 +992,21 @@ def tick(
 
     Now tick() holds the file lock only across dispatch (microseconds), hands
     each due job to `_DISPATCH_POOL`, and returns. The worker pool runs jobs
-    serially (max_workers=1) so jobs.json mutations stay serialized — but the
-    scheduler itself is unblocked, so new due jobs always fire on time.
+    serially (max_workers=1) so dispatcher-vs-worker file writes on
+    jobs.json stay serialized — but the scheduler itself is unblocked, so
+    new due jobs always fire on time.
 
-    Cross-process safety: the file lock still guards dispatch against overlap
-    between the gateway in-process ticker and a standalone daemon / manual
-    `hermes cron tick`. Within-process duplicate-dispatch is prevented by
-    `advance_next_run(job_id)` being called before submit, which moves the
-    job's next_run_at past the current tick window.
+    Duplicate-dispatch safety (both in-process and cross-process):
+    `reserve_for_dispatch(job_id)` is called under `jobs_transaction()` for
+    every due job before the worker is submitted. For recurring jobs this
+    advances `next_run_at` to the next scheduled occurrence. For once-
+    scheduled jobs it pushes `next_run_at` and sets `in_flight_until` to
+    `now + DISPATCH_STALE_LEASE_SECONDS` (30 min). `get_due_jobs()` skips
+    jobs with an unexpired `in_flight_until`, so a concurrent tick in this
+    or any other process cannot re-dispatch a job whose worker is still
+    running. On worker success, `mark_job_run()` clears the lease. On
+    worker / process crash, the lease expires naturally and the job becomes
+    eligible again — force-fired once-jobs are retried, not silently lost.
 
     Args:
         verbose: Whether to print status messages.
@@ -1026,40 +1040,45 @@ def tick(
 
     dispatched_futures: list[concurrent.futures.Future] = []
     try:
-        due_jobs = get_due_jobs()
+        # Claim and dispatch inside a single jobs_transaction so a concurrent
+        # tick from another process cannot see the same job as due between
+        # our get_due_jobs() and our reserve_for_dispatch() and double-
+        # dispatch it. The transaction is held for microseconds (no LLM
+        # calls, no I/O beyond jobs.json RMW).
+        with jobs_transaction():
+            due_jobs = get_due_jobs()
 
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
-            return 0
+            if verbose and not due_jobs:
+                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+                return 0
 
-        if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            if verbose:
+                logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        executed = 0
-        for job in due_jobs:
-            try:
-                # For recurring jobs (cron/interval), advance next_run_at to the
-                # next future occurrence BEFORE execution.  This way, if the
-                # process crashes mid-run, the job won't re-fire on restart.
-                # One-shot jobs are left alone so they can retry on restart.
-                # Also: advancing before dispatch prevents the NEXT tick from
-                # re-dispatching this job while the worker is still running.
-                advance_next_run(job["id"])
-
-                future = _DISPATCH_POOL.submit(
-                    _run_and_finalize, job, adapters, loop, verbose
-                )
-                dispatched_futures.append(future)
-                executed += 1
-
-            except Exception as e:
-                logger.error("Error dispatching job %s: %s", job.get("id", "?"), e)
+            executed = 0
+            for job in due_jobs:
                 try:
-                    mark_job_run(job["id"], False, str(e))
-                except Exception as mark_err:
-                    logger.error("Also failed to mark_job_run for %s: %s", job.get("id", "?"), mark_err)
+                    # Persist a dispatch claim before the worker is submitted.
+                    # Recurring: bump next_run_at to the next occurrence.
+                    # Once: bump next_run_at + set in_flight_until lease so
+                    # the job can be retried if the worker crashes before
+                    # mark_job_run clears the lease.
+                    reserve_for_dispatch(job["id"])
 
-        return executed
+                    future = _DISPATCH_POOL.submit(
+                        _run_and_finalize, job, adapters, loop, verbose
+                    )
+                    dispatched_futures.append(future)
+                    executed += 1
+
+                except Exception as e:
+                    logger.error("Error dispatching job %s: %s", job.get("id", "?"), e)
+                    try:
+                        mark_job_run(job["id"], False, str(e))
+                    except Exception as mark_err:
+                        logger.error("Also failed to mark_job_run for %s: %s", job.get("id", "?"), mark_err)
+
+            return executed
     finally:
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
