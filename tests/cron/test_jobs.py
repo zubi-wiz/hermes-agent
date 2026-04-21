@@ -185,6 +185,7 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.setattr("cron.jobs.JOBS_LOCK_FILE", tmp_path / "cron" / ".jobs.lock")
     return tmp_path
 
 
@@ -452,6 +453,295 @@ class TestAdvanceNextRun:
         # Now the job should NOT be due (simulates restart after crash)
         due_after = get_due_jobs()
         assert len(due_after) == 0, "Job should not be due after advance_next_run"
+
+
+class TestConcurrentJobsJsonRMW:
+    """Verify jobs_transaction serializes read-modify-write cycles across
+    both in-process threads AND separate OS processes.
+
+    Once scheduler.tick() dispatches jobs to a worker pool, the dispatcher
+    keeps calling reserve_for_dispatch / advance_next_run while the worker
+    calls mark_job_run.  Without serialization, multiple actors (threads or
+    processes) can load jobs.json, each mutate a different job, and race
+    their save — second save clobbers first.
+    """
+
+    def test_no_updates_lost_under_concurrent_in_process_rmw(self, tmp_cron_dir):
+        """In-process: concurrent mark_job_run(A) + advance_next_run(B) keep both updates."""
+        import threading
+        from cron.jobs import create_job, mark_job_run, advance_next_run, load_jobs, save_jobs
+
+        job_a = create_job(prompt="A", schedule="every 1h")
+        job_b = create_job(prompt="B", schedule="every 1h")
+        jobs = load_jobs()
+        past = (datetime.now() - timedelta(minutes=30)).isoformat()
+        for j in jobs:
+            j["next_run_at"] = past
+        save_jobs(jobs)
+
+        ITERATIONS = 40
+        errors: list[str] = []
+
+        def worker_mark(i):
+            try:
+                mark_job_run(job_a["id"], success=True, error=None)
+            except Exception as e:
+                errors.append(f"mark[{i}]: {e}")
+
+        def worker_advance(i):
+            try:
+                advance_next_run(job_b["id"])
+            except Exception as e:
+                errors.append(f"advance[{i}]: {e}")
+
+        threads: list[threading.Thread] = []
+        for i in range(ITERATIONS):
+            threads.append(threading.Thread(target=worker_mark, args=(i,)))
+            threads.append(threading.Thread(target=worker_advance, args=(i,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Worker errors: {errors[:5]}"
+
+        final = load_jobs()
+        final_a = next(j for j in final if j["id"] == job_a["id"])
+        final_b = next(j for j in final if j["id"] == job_b["id"])
+
+        assert final_a.get("last_run_at") is not None, "job A mark_job_run was lost to a race"
+        assert final_a.get("last_status") == "ok"
+
+        from cron.jobs import _ensure_aware, _hermes_now
+        b_next_dt = _ensure_aware(datetime.fromisoformat(final_b["next_run_at"]))
+        assert b_next_dt > _hermes_now(), "job B advance_next_run was lost to a race"
+
+    def test_no_updates_lost_across_processes(self, tmp_path):
+        """Cross-process: two subprocess-level actors running mark_job_run(A)
+        + advance_next_run(B) must both survive the save.
+
+        Without a cross-process file lock (threading.Lock alone is NOT
+        sufficient), one process's save clobbers the other process's
+        mutation.  Uses subprocess to force a second OS process sharing
+        the same HERMES_HOME.
+        """
+        import os as _os
+        import subprocess
+        import sys
+        import textwrap
+        import cron.jobs as jobs_mod
+        from cron.jobs import create_job, load_jobs, save_jobs, mark_job_run, _ensure_aware, _hermes_now
+
+        hermes_home = tmp_path / "xproc_hermes"
+        cron_dir = hermes_home / "cron"
+        cron_dir.mkdir(parents=True)
+
+        with patch.object(jobs_mod, "HERMES_DIR", hermes_home), \
+             patch.object(jobs_mod, "CRON_DIR", cron_dir), \
+             patch.object(jobs_mod, "JOBS_FILE", cron_dir / "jobs.json"), \
+             patch.object(jobs_mod, "OUTPUT_DIR", cron_dir / "output"), \
+             patch.object(jobs_mod, "JOBS_LOCK_FILE", cron_dir / ".jobs.lock"):
+
+            job_a = create_job(prompt="cross-A", schedule="every 1h")
+            job_b = create_job(prompt="cross-B", schedule="every 1h")
+            jobs = load_jobs()
+            past = (datetime.now() - timedelta(minutes=30)).isoformat()
+            for j in jobs:
+                j["next_run_at"] = past
+            save_jobs(jobs)
+
+            subproc_script = textwrap.dedent(
+                """
+                import sys
+                sys.path.insert(0, %(repo)r)
+                from cron.jobs import advance_next_run
+                for _ in range(200):
+                    advance_next_run(%(jobid)r)
+                print("SUBPROC_DONE")
+                """
+            ) % {
+                "repo": str(jobs_mod.Path(jobs_mod.__file__).parent.parent),
+                "jobid": job_b["id"],
+            }
+
+            env = {**_os.environ, "HERMES_HOME": str(hermes_home)}
+            proc = subprocess.Popen(
+                [sys.executable, "-c", subproc_script],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _ in range(200):
+                    mark_job_run(job_a["id"], success=True, error=None)
+                stdout, stderr = proc.communicate(timeout=30)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
+            assert proc.returncode == 0, (
+                f"subprocess failed rc={proc.returncode} "
+                f"stderr={stderr.decode()[:500]}"
+            )
+            assert b"SUBPROC_DONE" in stdout, "subprocess did not reach completion marker"
+
+            final = load_jobs()
+            final_a = next(j for j in final if j["id"] == job_a["id"])
+            final_b = next(j for j in final if j["id"] == job_b["id"])
+
+            assert final_a.get("last_run_at") is not None, (
+                "job A mark_job_run was clobbered by a cross-process "
+                "advance_next_run on B — the jobs file lock failed"
+            )
+            assert final_a.get("last_status") == "ok"
+
+            b_next_dt = _ensure_aware(datetime.fromisoformat(final_b["next_run_at"]))
+            assert b_next_dt > _hermes_now(), (
+                "job B advance_next_run was clobbered by a cross-process "
+                "mark_job_run on A — the jobs file lock failed"
+            )
+
+
+class TestReserveForDispatch:
+    """Tests for reserve_for_dispatch — unified dispatch-claim across kinds."""
+
+    def test_recurring_advances_next_run_at(self, tmp_cron_dir):
+        from cron.jobs import create_job, reserve_for_dispatch, load_jobs, save_jobs, _ensure_aware, _hermes_now
+
+        job = create_job(prompt="R", schedule="every 1h")
+        jobs = load_jobs()
+        past = (datetime.now() - timedelta(minutes=30)).isoformat()
+        jobs[0]["next_run_at"] = past
+        save_jobs(jobs)
+
+        assert reserve_for_dispatch(job["id"]) is True
+        updated = load_jobs()[0]
+        new_next = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        assert new_next > _hermes_now(), "recurring next_run_at must advance forward"
+        assert "in_flight_until" in updated, "recurring reservations still set the lease"
+
+    def test_once_sets_dispatch_lease(self, tmp_cron_dir):
+        from cron.jobs import create_job, reserve_for_dispatch, load_jobs, save_jobs, _ensure_aware, _hermes_now
+
+        job = create_job(prompt="O", schedule="30m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        assert reserve_for_dispatch(job["id"], stale_lease_seconds=1800) is True
+        updated = load_jobs()[0]
+        lease = _ensure_aware(datetime.fromisoformat(updated["in_flight_until"]))
+        next_run = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
+        now = _hermes_now()
+        assert lease > now, "lease must be in the future"
+        assert next_run == lease, "once-job next_run_at should mirror the lease"
+
+    def test_once_crash_recovery_after_lease(self, tmp_cron_dir):
+        from cron.jobs import create_job, reserve_for_dispatch, get_due_jobs, load_jobs, save_jobs
+
+        job = create_job(prompt="O", schedule="30m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        reserve_for_dispatch(job["id"], stale_lease_seconds=1)
+        assert all(j["id"] != job["id"] for j in get_due_jobs())
+
+        import time
+        time.sleep(1.2)
+        assert any(j["id"] == job["id"] for j in get_due_jobs()), "expired lease must allow retry"
+
+    def test_mark_job_run_clears_lease(self, tmp_cron_dir):
+        from cron.jobs import create_job, reserve_for_dispatch, mark_job_run, load_jobs, save_jobs
+
+        job = create_job(prompt="R", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=30)).isoformat()
+        save_jobs(jobs)
+
+        reserve_for_dispatch(job["id"])
+        assert "in_flight_until" in load_jobs()[0]
+
+        mark_job_run(job["id"], success=True, error=None)
+        assert "in_flight_until" not in load_jobs()[0]
+
+
+class TestMutationPathsWrappedInTransaction:
+    """create_job / update_job / remove_job must also hold jobs_transaction so
+    their load-modify-save cycles don't race with concurrent mark_job_run /
+    advance_next_run / reserve_for_dispatch from the worker pool.
+    """
+
+    def test_update_job_and_mark_job_run_dont_clobber(self, tmp_cron_dir):
+        import threading
+        from cron.jobs import create_job, update_job, mark_job_run, load_jobs
+
+        job = create_job(prompt="R", schedule="every 1h")
+        errors: list[str] = []
+
+        def hammer_update():
+            try:
+                for i in range(100):
+                    update_job(job["id"], {"name": f"renamed-{i}"})
+            except Exception as e:
+                errors.append(f"update: {e}")
+
+        def hammer_mark():
+            try:
+                for _ in range(100):
+                    mark_job_run(job["id"], success=True, error=None)
+            except Exception as e:
+                errors.append(f"mark: {e}")
+
+        t1 = threading.Thread(target=hammer_update)
+        t2 = threading.Thread(target=hammer_mark)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        assert not errors, f"Worker errors: {errors[:3]}"
+
+        final = load_jobs()
+        final_job = next(j for j in final if j["id"] == job["id"])
+        assert final_job.get("last_run_at") is not None, (
+            "mark_job_run was clobbered by concurrent update_job"
+        )
+        assert final_job.get("last_status") == "ok"
+        assert final_job.get("name", "").startswith("renamed-"), (
+            "update_job was clobbered by concurrent mark_job_run"
+        )
+
+    def test_create_job_and_remove_job_are_atomic(self, tmp_cron_dir):
+        """Concurrent create_job + remove_job don't leave the file in an
+        inconsistent state."""
+        import threading
+        from cron.jobs import create_job, remove_job, load_jobs
+
+        created_ids: list[str] = []
+        create_lock = threading.Lock()
+
+        def hammer_create():
+            for i in range(30):
+                j = create_job(prompt=f"c-{i}", schedule="every 1h")
+                with create_lock:
+                    created_ids.append(j["id"])
+
+        def hammer_remove():
+            for _ in range(60):
+                with create_lock:
+                    target = created_ids[-1] if created_ids else None
+                if target:
+                    remove_job(target)
+
+        t1 = threading.Thread(target=hammer_create)
+        t2 = threading.Thread(target=hammer_remove)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+
+        final = load_jobs()
+        final_ids = {j["id"] for j in final}
+        assert final_ids.issubset(set(created_ids)), (
+            "remaining entries are not a subset of created — state corrupted"
+        )
 
 
 class TestGetDueJobs:

@@ -5,6 +5,7 @@ Jobs are stored in ~/.hermes/cron/jobs.json
 Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
+import contextlib
 import copy
 import json
 import logging
@@ -17,6 +18,23 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any
+
+# fcntl is Unix-only; on Windows use msvcrt for file locking.  Used by
+# jobs_transaction() below to provide CROSS-PROCESS serialization of
+# jobs.json read-modify-write cycles — a plain threading.Lock only
+# serializes threads within one process, which silently drops updates
+# when a second process (e.g. standalone daemon, manual CLI invocation,
+# or a separate gateway instance) RMWs the same file concurrently.
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        _msvcrt = None
+else:
+    _msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +53,97 @@ except ImportError:
 HERMES_DIR = get_hermes_home().resolve()
 CRON_DIR = HERMES_DIR / "cron"
 JOBS_FILE = CRON_DIR / "jobs.json"
-
-# In-process lock protecting load_jobs→modify→save_jobs cycles.
-# Required when tick() runs jobs in parallel threads — without this,
-# concurrent mark_job_run / advance_next_run calls can clobber each other.
-_jobs_file_lock = threading.Lock()
 OUTPUT_DIR = CRON_DIR / "output"
+JOBS_LOCK_FILE = CRON_DIR / ".jobs.lock"
 ONESHOT_GRACE_SECONDS = 120
+
+# Stale-lease window for once-scheduled jobs' dispatch claim.  When tick()
+# reserves a once-job for dispatch (reserve_for_dispatch), it bumps
+# next_run_at + in_flight_until this far into the future.  If the worker
+# succeeds, mark_job_run() disables the job before the lease expires.  If
+# the worker / process crashes, the job becomes due again after the window
+# expires — so the user's force-fire is retried automatically rather than
+# silently lost.  30 min is long enough to cover any realistic LLM agent
+# turn plus delivery, and short enough that a crashed force-fire retries
+# same-session.
+DISPATCH_STALE_LEASE_SECONDS = 1800
+
+
+# =============================================================================
+# Cross-process jobs.json transaction lock
+# =============================================================================
+#
+# Every read-modify-write path on jobs.json (mark_job_run, advance_next_run,
+# reserve_for_dispatch, create_job, update_job, remove_job, load_jobs'
+# auto-repair save, and scheduler.tick()'s dispatch claim) must serialize
+# through this lock.  Otherwise two actors — two PROCESSES (gateway + manual
+# CLI + standalone daemon) OR two threads (tick dispatcher + parallel
+# workers + CLI/web/API CRUD mutators) — can load jobs.json, each mutate a
+# different job, and race their save: second save overwrites first,
+# silently dropping one mutation.
+#
+# This supersedes the prior in-process threading.Lock (#13021), which could
+# not protect against cross-process races once async dispatch lets workers
+# run outside the tick file lock.
+#
+# Scope discipline: hold for microseconds to milliseconds per RMW cycle.
+# Do NOT hold across run_job() or any LLM-latency path — that would
+# recreate the head-of-line blocking class this fix closes.
+#
+# Re-entrancy: nest-safe within a single thread via a thread-local counter.
+# The same thread can enter jobs_transaction() recursively (tick → reserve →
+# mark_job_run etc.) without deadlocking.  Re-entry by a DIFFERENT thread
+# of the same process blocks on the file lock until the holding thread's
+# outermost transaction exits — correct serialization for our dispatcher-
+# vs-worker case.
+
+_jobs_lock_state = threading.local()
+
+
+@contextlib.contextmanager
+def jobs_transaction():
+    """Cross-process exclusive lock for a jobs.json RMW cycle.
+
+    Blocking acquire (waits for turn) — do not use with NB semantics.
+    Holds an fcntl/msvcrt exclusive lock on ``JOBS_LOCK_FILE``, plus a
+    thread-local counter for nested re-entry within a thread.
+    """
+    depth = getattr(_jobs_lock_state, "depth", 0)
+    if depth > 0:
+        _jobs_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _jobs_lock_state.depth -= 1
+        return
+
+    # Outermost entry — actually acquire the file lock.
+    JOBS_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(JOBS_LOCK_FILE, "w")
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+        elif _msvcrt is not None:
+            _msvcrt.locking(lock_fd.fileno(), _msvcrt.LK_LOCK, 1)
+        # else: no file-locking primitive available — fall through.  Tests
+        # on such platforms lose cross-process safety but keep in-process
+        # thread-local ordering via the counter, which is better than
+        # nothing.  Real production runs on Unix/macOS with fcntl.
+
+        _jobs_lock_state.depth = 1
+        try:
+            yield
+        finally:
+            _jobs_lock_state.depth = 0
+    finally:
+        if _fcntl is not None:
+            _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            try:
+                _msvcrt.locking(lock_fd.fileno(), _msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+        lock_fd.close()
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -340,8 +442,13 @@ def load_jobs() -> List[Dict[str, Any]]:
                 data = json.loads(f.read(), strict=False)
                 jobs = data.get("jobs", [])
                 if jobs:
-                    # Auto-repair: rewrite with proper escaping
-                    save_jobs(jobs)
+                    # Auto-repair: rewrite with proper escaping.  Wrapped
+                    # in jobs_transaction so a corrupt-file recovery in one
+                    # process can't race another process's RMW.  Nested
+                    # inside any outer jobs_transaction via the thread-
+                    # local counter, so safe to enter twice.
+                    with jobs_transaction():
+                        save_jobs(jobs)
                     logger.warning("Auto-repaired jobs.json (had invalid control characters)")
                 return jobs
         except Exception as e:
@@ -466,9 +573,10 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
     }
 
-    jobs = load_jobs()
-    jobs.append(job)
-    save_jobs(jobs)
+    with jobs_transaction():
+        jobs = load_jobs()
+        jobs.append(job)
+        save_jobs(jobs)
 
     return job
 
@@ -492,41 +600,42 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
-    jobs = load_jobs()
-    for i, job in enumerate(jobs):
-        if job["id"] != job_id:
-            continue
+    with jobs_transaction():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] != job_id:
+                continue
 
-        updated = _apply_skill_fields({**job, **updates})
-        schedule_changed = "schedule" in updates
+            updated = _apply_skill_fields({**job, **updates})
+            schedule_changed = "schedule" in updates
 
-        if "skills" in updates or "skill" in updates:
-            normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
-            updated["skills"] = normalized_skills
-            updated["skill"] = normalized_skills[0] if normalized_skills else None
+            if "skills" in updates or "skill" in updates:
+                normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
+                updated["skills"] = normalized_skills
+                updated["skill"] = normalized_skills[0] if normalized_skills else None
 
-        if schedule_changed:
-            updated_schedule = updated["schedule"]
-            # The API may pass schedule as a raw string (e.g. "every 10m")
-            # instead of a pre-parsed dict.  Normalize it the same way
-            # create_job() does so downstream code can call .get() safely.
-            if isinstance(updated_schedule, str):
-                updated_schedule = parse_schedule(updated_schedule)
-                updated["schedule"] = updated_schedule
-            updated["schedule_display"] = updates.get(
-                "schedule_display",
-                updated_schedule.get("display", updated.get("schedule_display")),
-            )
-            if updated.get("state") != "paused":
-                updated["next_run_at"] = compute_next_run(updated_schedule)
+            if schedule_changed:
+                updated_schedule = updated["schedule"]
+                # The API may pass schedule as a raw string (e.g. "every 10m")
+                # instead of a pre-parsed dict.  Normalize it the same way
+                # create_job() does so downstream code can call .get() safely.
+                if isinstance(updated_schedule, str):
+                    updated_schedule = parse_schedule(updated_schedule)
+                    updated["schedule"] = updated_schedule
+                updated["schedule_display"] = updates.get(
+                    "schedule_display",
+                    updated_schedule.get("display", updated.get("schedule_display")),
+                )
+                if updated.get("state") != "paused":
+                    updated["next_run_at"] = compute_next_run(updated_schedule)
 
-        if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
-            updated["next_run_at"] = compute_next_run(updated["schedule"])
+            if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+                updated["next_run_at"] = compute_next_run(updated["schedule"])
 
-        jobs[i] = updated
-        save_jobs(jobs)
-        return _apply_skill_fields(jobs[i])
-    return None
+            jobs[i] = updated
+            save_jobs(jobs)
+            return _apply_skill_fields(jobs[i])
+        return None
 
 
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -580,13 +689,14 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID."""
-    jobs = load_jobs()
-    original_len = len(jobs)
-    jobs = [j for j in jobs if j["id"] != job_id]
-    if len(jobs) < original_len:
-        save_jobs(jobs)
-        return True
-    return False
+    with jobs_transaction():
+        jobs = load_jobs()
+        original_len = len(jobs)
+        jobs = [j for j in jobs if j["id"] != job_id]
+        if len(jobs) < original_len:
+            save_jobs(jobs)
+            return True
+        return False
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
@@ -600,7 +710,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
-    with _jobs_file_lock:
+    with jobs_transaction():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
@@ -610,7 +720,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
-                
+                # Clear the dispatch-claim lease set by reserve_for_dispatch()
+                # so that if the schedule replays this job at some future
+                # point, the in_flight_until field doesn't linger.
+                job.pop("in_flight_until", None)
+
                 # Increment completed count
                 if job.get("repeat"):
                     job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
@@ -652,7 +766,7 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    with _jobs_file_lock:
+    with jobs_transaction():
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
@@ -669,6 +783,66 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def reserve_for_dispatch(job_id: str,
+                         stale_lease_seconds: int = DISPATCH_STALE_LEASE_SECONDS) -> bool:
+    """Claim a job for dispatch so the next tick won't re-dispatch it.
+
+    Unified across recurring and once-scheduled jobs.  Called by
+    ``scheduler.tick()`` under ``jobs_transaction()`` after ``get_due_jobs()``
+    returns a job and before the worker is submitted.
+
+    * Recurring jobs (``kind in ("cron", "interval")``): advance ``next_run_at``
+      to the next scheduled occurrence (same semantics as ``advance_next_run``).
+      This keeps the at-most-once guarantee for recurring jobs — if the worker
+      crashes mid-run, the job is skipped and re-fires at its next natural
+      time.  A belt-and-suspenders ``in_flight_until`` lease is also set so
+      ``get_due_jobs()`` can filter this job out if ``next_run_at`` somehow
+      ends up stale.
+    * Once-scheduled jobs (``kind == "once"`` or absent): push ``next_run_at``
+      AND ``in_flight_until`` to ``now + stale_lease_seconds``.  This is the
+      critical fix for force-fired once-jobs (Mendi reviews etc.): without
+      this, ``advance_next_run`` no-ops on once-jobs, so the job remains due
+      in jobs.json while the worker is running and the next tick
+      re-dispatches it.  With the lease, ``get_due_jobs`` skips the job
+      while the lease is live.  ``mark_job_run()`` clears ``in_flight_until``
+      on success (and disables the job as usual).  If the worker / process
+      crashes and never marks the job done, the lease expires naturally
+      and the job becomes due again — force-fired reviews are retried
+      rather than silently lost.
+
+    Returns True if the job was found and its claim persisted, False
+    otherwise (job_id unknown or no-op).
+    """
+    with jobs_transaction():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            kind = (job.get("schedule") or {}).get("kind")
+            now = _hermes_now()
+            now_iso = now.isoformat()
+
+            if kind in ("cron", "interval"):
+                new_next = compute_next_run(job["schedule"], now_iso)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    job["in_flight_until"] = (
+                        now + timedelta(seconds=stale_lease_seconds)
+                    ).isoformat()
+                    save_jobs(jobs)
+                    return True
+                return False
+
+            # kind == "once" or missing — push the dispatch lease
+            lease_until = (now + timedelta(seconds=stale_lease_seconds)).isoformat()
+            job["next_run_at"] = lease_until
+            job["in_flight_until"] = lease_until
+            save_jobs(jobs)
+            return True
+
+        return False
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -676,76 +850,95 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     (more than one period in the past, e.g. because the gateway was down),
     the job is fast-forwarded to the next future run instead of firing
     immediately.  This prevents a burst of missed jobs on gateway restart.
+
+    Jobs with a live ``in_flight_until`` lease (set by
+    ``reserve_for_dispatch``) are excluded — they are already claimed for
+    dispatch by an in-flight worker.  If the lease has expired (worker
+    crashed or machine rebooted), the filter lets the job through so it
+    can be retried.
     """
-    now = _hermes_now()
-    raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
-    needs_save = False
+    with jobs_transaction():
+        now = _hermes_now()
+        raw_jobs = load_jobs()
+        jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+        due = []
+        needs_save = False
 
-    for job in jobs:
-        if not job.get("enabled", True):
-            continue
-
-        next_run = job.get("next_run_at")
-        if not next_run:
-            recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
-            if not recovered_next:
+        for job in jobs:
+            if not job.get("enabled", True):
                 continue
 
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
-                job.get("name", job["id"]),
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
+            # Skip jobs that have an unexpired dispatch lease — another
+            # worker is already running them.  Expired leases (post-crash)
+            # fall through so the job gets another chance.
+            lease = job.get("in_flight_until")
+            if lease:
+                try:
+                    lease_dt = _ensure_aware(datetime.fromisoformat(lease))
+                except (TypeError, ValueError):
+                    lease_dt = None
+                if lease_dt is not None and lease_dt > now:
+                    continue
 
-        next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        if next_run_dt <= now:
-            schedule = job.get("schedule", {})
-            kind = schedule.get("kind")
+            next_run = job.get("next_run_at")
+            if not next_run:
+                recovered_next = _recoverable_oneshot_run_at(
+                    job.get("schedule", {}),
+                    now,
+                    last_run_at=job.get("last_run_at"),
+                )
+                if not recovered_next:
+                    continue
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
+                job["next_run_at"] = recovered_next
+                next_run = recovered_next
+                logger.info(
+                    "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                    job.get("name", job["id"]),
+                    recovered_next,
+                )
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        rj["next_run_at"] = recovered_next
+                        needs_save = True
+                        break
 
-            due.append(job)
+            next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
+            if next_run_dt <= now:
+                schedule = job.get("schedule", {})
+                kind = schedule.get("kind")
 
-    if needs_save:
-        save_jobs(raw_jobs)
+                # For recurring jobs, check if the scheduled time is stale
+                # (gateway was down and missed the window). Fast-forward to
+                # the next future occurrence instead of firing a stale run.
+                grace = _compute_grace_seconds(schedule)
+                if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
+                    # Job is past its catch-up grace window — this is a stale missed run.
+                    # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
+                    new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next:
+                        logger.info(
+                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
+                            "Fast-forwarding to next run: %s",
+                            job.get("name", job["id"]),
+                            next_run,
+                            grace,
+                            new_next,
+                        )
+                        # Update the job in storage
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        continue  # Skip this run
 
-    return due
+                due.append(job)
+
+        if needs_save:
+            save_jobs(raw_jobs)
+
+        return due
 
 
 def save_job_output(job_id: str, output: str):

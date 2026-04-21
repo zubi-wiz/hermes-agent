@@ -76,7 +76,14 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_run,
+    reserve_for_dispatch,
+    jobs_transaction,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -89,6 +96,67 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+# -----------------------------------------------------------------------------
+# Module-level async-dispatch pool
+# -----------------------------------------------------------------------------
+#
+# tick() submits each due job here and returns immediately — the worker pool
+# runs the LLM agent turn + delivery + mark_job_run in the background.  This
+# is the correctness fix for the head-of-line blocking class: the file lock
+# .tick.lock is held only across dispatch (microseconds), so subsequent 60s
+# ticks can grab new due jobs while earlier jobs are still running.
+#
+# This supersedes the per-tick ThreadPoolExecutor + .result()-wait pattern
+# introduced by #13021 — that fix parallelised jobs WITHIN a tick but still
+# held the tick lock for the duration of the longest job, so force-fired
+# once-jobs that became due mid-tick starved until the current tick
+# completed (Mendi reviews observed 30-40 min gate delays).
+#
+# Pool sizing:
+# - HERMES_CRON_MAX_PARALLEL env var > cron.max_parallel_jobs config > Python
+#   ThreadPoolExecutor default (min(32, (cpu_count() or 1) + 4)).
+# - Value 1 = serial worker (tick still returns immediately; second job queues).
+# - Any other value = parallel workers.
+# Config is read at module load; changes require gateway restart.  This is
+# intentional — mid-run resizing of an ExecutorPool is unsupported.
+
+import atexit as _atexit
+
+
+def _resolve_max_workers_at_init() -> Optional[int]:
+    """Resolve pool max_workers from HERMES_CRON_MAX_PARALLEL > config > default."""
+    try:
+        env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+        if env_par:
+            value = int(env_par)
+            return value if value > 0 else None
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid HERMES_CRON_MAX_PARALLEL value; falling back to config / default"
+        )
+    try:
+        from hermes_cli.config import load_config as _load_cfg
+        ucfg = _load_cfg() or {}
+        cfg_par = (ucfg.get("cron") or {}).get("max_parallel_jobs")
+        if cfg_par is not None:
+            value = int(cfg_par)
+            return value if value > 0 else None
+    except Exception:
+        pass
+    return None  # => Python ThreadPoolExecutor default
+
+
+_DISPATCH_MAX_WORKERS = _resolve_max_workers_at_init()
+_DISPATCH_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DISPATCH_MAX_WORKERS,
+    thread_name_prefix="hermes-cron-worker",
+)
+# Cancel queued jobs on interpreter shutdown; in-flight LLM calls get kernel-
+# killed on process exit (matches pre-#13021 behaviour).  wait=False so a
+# long-running agent turn doesn't block graceful shutdown.
+_atexit.register(_DISPATCH_POOL.shutdown, wait=False, cancel_futures=True)
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1028,20 +1096,108 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
-def tick(verbose: bool = True, adapters=None, loop=None) -> int:
+def _process_job(job: dict, adapters, loop, verbose: bool) -> bool:
+    """Run one due job end-to-end on the dispatch pool: execute, save, deliver, mark.
+
+    Runs inside an isolated ``contextvars`` copy (set by the tick submitter)
+    so session/delivery state stays isolated per-job and does not leak
+    across workers running in parallel.
     """
-    Check and run all due jobs.
-    
-    Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
-    
+    try:
+        success, output, final_response, error = run_job(job)
+
+        output_file = save_job_output(job["id"], output)
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        # Deliver the final response to the origin/target chat.
+        # If the agent responded with [SILENT], skip delivery (but
+        # output is already saved above).  Failed jobs always deliver.
+        deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+        should_deliver = bool(deliver_content)
+        if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            should_deliver = False
+
+        delivery_error = None
+        if should_deliver:
+            try:
+                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+        # Treat empty final_response as a soft failure so last_status
+        # is not "ok" — the agent ran but produced nothing useful.
+        # (issue #8585)
+        if success and not final_response:
+            success = False
+            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        return True
+
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job.get("id", "?"), e)
+        try:
+            mark_job_run(job["id"], False, str(e))
+        except Exception as mark_err:
+            logger.error("Also failed to mark_job_run for %s: %s", job.get("id", "?"), mark_err)
+        return False
+
+
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    _wait_for_completion: bool = False,
+) -> int:
+    """
+    Dispatch all due jobs to the module-level worker pool and return promptly.
+
+    This supersedes two earlier designs:
+
+    * Pre-#13021: serial for-loop inside ``.tick.lock`` — a single slow job
+      blocked the scheduler for 3-10 min, starving every other cron in the
+      same tick window.
+    * #13021:     per-tick ``ThreadPoolExecutor(max_workers=N)`` with
+      ``.result()`` wait — jobs WITHIN a tick run in parallel, but ``tick()``
+      still holds ``.tick.lock`` for the duration of the longest job, so
+      jobs that become due MID-TICK (e.g. a force-fired once-scheduled
+      Mendi review) starve until the current tick completes.
+
+    Now ``tick()`` holds ``.tick.lock`` only across dispatch (microseconds),
+    submits each due job to the module-level ``_DISPATCH_POOL``, and returns.
+    The next 60s tick can always pick up newly due jobs regardless of what
+    earlier jobs are still running.
+
+    Duplicate-dispatch safety (in-process AND cross-process):
+    ``reserve_for_dispatch(job_id)`` is called under ``jobs_transaction()``
+    for every due job before the worker is submitted.
+    * Recurring jobs: advances ``next_run_at`` to the next scheduled
+      occurrence (same crash-safety semantics as ``advance_next_run``).
+    * Once-scheduled jobs: pushes ``next_run_at`` + sets ``in_flight_until``
+      to ``now + DISPATCH_STALE_LEASE_SECONDS`` (30 min).  ``get_due_jobs()``
+      filters out jobs with an unexpired lease, so a concurrent tick in
+      this or any other process cannot re-dispatch a job whose worker is
+      still running.  On worker success, ``mark_job_run()`` clears the
+      lease.  On worker / process crash, the lease expires naturally and
+      the job becomes eligible again — force-fired once-jobs are retried,
+      not silently lost.
+
     Args:
-        verbose: Whether to print status messages
-        adapters: Optional dict mapping Platform → live adapter (from gateway)
-        loop: Optional asyncio event loop (from gateway) for live adapter sends
-    
+        verbose: Whether to print status messages.
+        adapters: Optional dict mapping Platform → live adapter (from gateway).
+        loop: Optional asyncio event loop (from gateway) for live adapter sends.
+        _wait_for_completion: If True, block until all jobs dispatched by
+            this call have finished.  Intended for tests and scripted single-
+            job callers — do NOT set True from the gateway ticker or the
+            head-of-line bug returns.
+
     Returns:
-        Number of jobs executed (0 if another tick is already running)
+        Number of jobs dispatched this tick (0 if another tick is already
+        running or no jobs are due).  Dispatched, not completed — use
+        ``_wait_for_completion=True`` if you need completion semantics.
     """
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1059,100 +1215,59 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             lock_fd.close()
         return 0
 
+    dispatched_futures: list[concurrent.futures.Future] = []
     try:
-        due_jobs = get_due_jobs()
+        # Claim and dispatch inside a single jobs_transaction so a concurrent
+        # tick from another process cannot see the same job as due between
+        # our get_due_jobs() and our reserve_for_dispatch() and double-
+        # dispatch it.  The transaction is held for microseconds (no LLM
+        # calls, no I/O beyond jobs.json RMW).
+        with jobs_transaction():
+            due_jobs = get_due_jobs()
 
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
-            return 0
+            if verbose and not due_jobs:
+                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+                return 0
 
-        if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            if verbose:
+                logger.info(
+                    "%s - %s job(s) due; dispatching to pool (max_workers=%s)",
+                    _hermes_now().strftime('%H:%M:%S'),
+                    len(due_jobs),
+                    _DISPATCH_MAX_WORKERS if _DISPATCH_MAX_WORKERS else "default",
+                )
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        for job in due_jobs:
-            advance_next_run(job["id"])
-
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
-        # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
-        _max_workers: Optional[int] = None
-        try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
-            if _env_par:
-                _max_workers = int(_env_par) or None
-        except (ValueError, TypeError):
-            logger.warning("Invalid HERMES_CRON_MAX_PARALLEL value; defaulting to unbounded")
-        if _max_workers is None:
-            try:
-                from hermes_cli.config import load_config
-                _ucfg = load_config() or {}
-                _cfg_par = (
-                    _ucfg.get("cron", {}) if isinstance(_ucfg, dict) else {}
-                ).get("max_parallel_jobs")
-                if _cfg_par is not None:
-                    _max_workers = int(_cfg_par) or None
-            except Exception:
-                pass
-
-        if verbose:
-            logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
-                len(due_jobs),
-                _max_workers if _max_workers else "unbounded",
-            )
-
-        def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end: execute, save, deliver, mark."""
-            try:
-                success, output, final_response, error = run_job(job)
-
-                output_file = save_job_output(job["id"], output)
-                if verbose:
-                    logger.info("Output saved to: %s", output_file)
-
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
-                # Treat empty final_response as a soft failure so last_status
-                # is not "ok" — the agent ran but produced nothing useful.
-                # (issue #8585)
-                if success and not final_response:
-                    success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
-
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-                return True
-
-            except Exception as e:
-                logger.error("Error processing job %s: %s", job['id'], e)
-                mark_job_run(job["id"], False, str(e))
-                return False
-
-        # Run all due jobs concurrently, each in its own ContextVar copy
-        # so session/delivery state stays isolated per-thread.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
-            _futures = []
+            executed = 0
             for job in due_jobs:
-                _ctx = contextvars.copy_context()
-                _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-            _results = [f.result() for f in _futures]
+                try:
+                    # Persist a dispatch claim before the worker is submitted.
+                    # Recurring: bump next_run_at to the next occurrence.
+                    # Once: bump next_run_at + set in_flight_until lease so
+                    # the job can be retried if the worker crashes before
+                    # mark_job_run clears the lease.
+                    reserve_for_dispatch(job["id"])
 
-        return sum(_results)
+                    # Copy the current context so session/delivery ContextVars
+                    # (per #13021) stay isolated per-job even under parallel
+                    # execution.
+                    _ctx = contextvars.copy_context()
+                    future = _DISPATCH_POOL.submit(
+                        _ctx.run, _process_job, job, adapters, loop, verbose
+                    )
+                    dispatched_futures.append(future)
+                    executed += 1
+
+                except Exception as e:
+                    logger.error("Error dispatching job %s: %s", job.get("id", "?"), e)
+                    try:
+                        mark_job_run(job["id"], False, str(e))
+                    except Exception as mark_err:
+                        logger.error(
+                            "Also failed to mark_job_run for %s: %s",
+                            job.get("id", "?"), mark_err,
+                        )
+
+            return executed
     finally:
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -1162,6 +1277,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             except (OSError, IOError):
                 pass
         lock_fd.close()
+
+        # Waiting happens OUTSIDE the file lock so holding the lock while a
+        # 10-min LLM call runs never recurs even with this opt-in.
+        if _wait_for_completion and dispatched_futures:
+            concurrent.futures.wait(dispatched_futures)
 
 
 if __name__ == "__main__":

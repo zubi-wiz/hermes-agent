@@ -12,6 +12,27 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+@pytest.fixture
+def isolated_tick_locks(tmp_path):
+    """Patch scheduler + jobs lock paths + JOBS_FILE to a per-test tmp dir.
+
+    Tests that call tick() without this fixture contend with any live
+    gateway process (which also holds `.tick.lock` briefly every 60s) and
+    each other under pytest-xdist.  Patching all the lock file paths AND
+    the backing JOBS_FILE gives each test a fully isolated state so
+    outcomes are deterministic regardless of the real hermes home contents.
+    """
+    import cron.jobs as _jobs_mod
+    jobs_json = tmp_path / "jobs.json"
+    jobs_json.write_text('{"jobs": [], "updated_at": null}')
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._LOCK_DIR", tmp_path), \
+         patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+         patch.object(_jobs_mod, "JOBS_LOCK_FILE", tmp_path / ".jobs.lock"), \
+         patch.object(_jobs_mod, "JOBS_FILE", jobs_json):
+        yield tmp_path
+
+
 class TestResolveOrigin:
     def test_full_origin(self):
         job = {
@@ -735,14 +756,18 @@ class TestRunJobSessionPersistence:
 
         fake_db = MagicMock()
 
+        import cron.jobs as _jobs_mod
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._LOCK_DIR", tmp_path), \
+             patch("cron.scheduler._LOCK_FILE", tmp_path / ".tick.lock"), \
+             patch.object(_jobs_mod, "JOBS_LOCK_FILE", tmp_path / ".jobs.lock"), \
              patch("cron.scheduler.get_due_jobs", return_value=[job]), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.reserve_for_dispatch"), \
              patch("cron.scheduler.mark_job_run") as mock_mark, \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("cron.scheduler.run_job", return_value=(True, "output", "", None)):
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
 
         # Should be called with success=False because final_response is empty
         mock_mark.assert_called_once()
@@ -1067,6 +1092,7 @@ class TestRunJobSkillBacked:
         assert "Combine the results." in prompt_arg
 
 
+@pytest.mark.usefixtures("isolated_tick_locks")
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
@@ -1086,7 +1112,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             with caplog.at_level(logging.INFO, logger="cron.scheduler"):
-                tick(verbose=False)
+                tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
@@ -1097,7 +1123,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_silent_trailing_suppresses_delivery(self):
@@ -1109,7 +1135,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_silent_is_case_insensitive(self):
@@ -1119,7 +1145,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_not_called()
 
     def test_failed_job_always_delivers(self):
@@ -1130,7 +1156,7 @@ class TestSilentDelivery:
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         deliver_mock.assert_called_once()
 
     def test_output_saved_even_when_delivery_suppressed(self):
@@ -1141,7 +1167,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             save_mock.return_value = "/tmp/out.md"
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
         save_mock.assert_called_once_with("monitor-job", "# full output")
         deliver_mock.assert_not_called()
 
@@ -1461,15 +1487,20 @@ class TestSendMediaViaAdapter:
 
 
 class TestParallelTick:
-    """Verify that tick() runs due jobs concurrently and isolates ContextVars."""
+    """Verify that tick() dispatches due jobs concurrently and isolates ContextVars."""
 
     @pytest.fixture(autouse=True)
     def _isolate_tick_lock(self, tmp_path):
-        """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
+        """Point the tick + jobs lock files at a per-test temp dir to avoid xdist contention."""
+        import cron.jobs as _jobs_mod
         lock_dir = tmp_path / "cron"
         lock_dir.mkdir()
+        jobs_json = lock_dir / "jobs.json"
+        jobs_json.write_text('{"jobs": [], "updated_at": null}')
         with patch("cron.scheduler._LOCK_DIR", lock_dir), \
-             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+             patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"), \
+             patch.object(_jobs_mod, "JOBS_LOCK_FILE", lock_dir / ".jobs.lock"), \
+             patch.object(_jobs_mod, "JOBS_FILE", jobs_json):
             yield
 
     def test_parallel_jobs_run_concurrently(self):
@@ -1493,13 +1524,13 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.reserve_for_dispatch"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            result = tick(verbose=False)
+            result = tick(verbose=False, _wait_for_completion=True)
 
         assert result == 2
         # Both starts happened before both ends — proof of concurrency
@@ -1538,45 +1569,208 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.reserve_for_dispatch"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
-            tick(verbose=False)
+            tick(verbose=False, _wait_for_completion=True)
 
         assert seen["tg-job"] == {"platform": "telegram", "chat_id": "111"}
         assert seen["dc-job"] == {"platform": "discord", "chat_id": "222"}
 
-    def test_max_parallel_env_var(self, monkeypatch):
-        """HERMES_CRON_MAX_PARALLEL=1 should restore serial behaviour."""
+    def test_max_parallel_resolution_from_env_var(self, monkeypatch):
+        """HERMES_CRON_MAX_PARALLEL env var is honored by the init resolver.
+
+        The module-level dispatch pool (_DISPATCH_POOL) is constructed at
+        module import and its size is fixed; changing max_parallel at
+        runtime requires a gateway restart.  What we verify here is that
+        the init resolver reads the env var correctly — which governs pool
+        size on the next process start.
+        """
+        from cron.scheduler import _resolve_max_workers_at_init
+
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
-        call_times = []
+        assert _resolve_max_workers_at_init() == 1
 
-        def mock_run_job(job):
-            import time
-            call_times.append(("start", job["id"], time.monotonic()))
-            time.sleep(0.05)
-            call_times.append(("end", job["id"], time.monotonic()))
-            return (True, "output", "response", None)
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "4")
+        assert _resolve_max_workers_at_init() == 4
 
-        jobs = [
-            {"id": "s1", "name": "s1", "deliver": "local"},
-            {"id": "s2", "name": "s2", "deliver": "local"},
-        ]
+        monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "0")
+        # 0 and negatives map to None (Python default)
+        assert _resolve_max_workers_at_init() is None
 
-        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
-             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
-             patch("cron.scheduler._deliver_result", return_value=None), \
-             patch("cron.scheduler.mark_job_run"):
+        monkeypatch.delenv("HERMES_CRON_MAX_PARALLEL", raising=False)
+        # No env, no config with the key → None (Python default)
+        # (config lookup may also contribute; we only assert env precedence here)
+        val = _resolve_max_workers_at_init()
+        assert val is None or isinstance(val, int)
+
+
+@pytest.mark.usefixtures("isolated_tick_locks")
+class TestTickReserveBeforeRun:
+    """Verify that tick() calls reserve_for_dispatch before run_job for crash safety
+    and cross-process duplicate-dispatch protection.
+    """
+
+    def test_reserve_called_before_run_job(self, tmp_path):
+        """reserve_for_dispatch must be called before run_job to claim the job
+        for dispatch — otherwise a concurrent tick could re-dispatch it.
+        """
+        call_order = []
+
+        def fake_reserve(job_id):
+            call_order.append(("reserve", job_id))
+            return True
+
+        def fake_run_job(job):
+            call_order.append(("run", job["id"]))
+            return True, "output", "response", None
+
+        fake_job = {
+            "id": "test-reserve",
+            "name": "test",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "15 6 * * *"},
+        }
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+             patch("cron.scheduler.reserve_for_dispatch", side_effect=fake_reserve) as reserve_mock, \
+             patch("cron.scheduler.run_job", side_effect=fake_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
             from cron.scheduler import tick
-            result = tick(verbose=False)
+            executed = tick(verbose=False, _wait_for_completion=True)
 
-        assert result == 2
-        # With max_workers=1, second job starts after first ends
-        end_s1 = [t for action, jid, t in call_times if action == "end" and jid == "s1"][0]
-        start_s2 = [t for action, jid, t in call_times if action == "start" and jid == "s2"][0]
-        assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
+        assert executed == 1
+        reserve_mock.assert_called_once_with("test-reserve")
+        # reserve must happen before run
+        assert call_order == [("reserve", "test-reserve"), ("run", "test-reserve")]
+
+
+@pytest.mark.usefixtures("isolated_tick_locks")
+class TestNonBlockingTick:
+    """Regression tests for head-of-line blocking fix.
+
+    Pre-#13021 tick() held the .tick.lock across each job's full execution.
+    #13021 parallelised jobs WITHIN a tick but still held the lock until
+    the longest-running job in the tick finished — so jobs that became due
+    MID-TICK (force-fired once-jobs) still starved.  This module-level
+    async-dispatch design makes tick() return immediately after submit.
+    """
+
+    def test_tick_returns_before_run_job_completes(self, tmp_path):
+        """tick() must return before run_job finishes when caller doesn't wait."""
+        import threading
+        import time
+
+        run_job_started = threading.Event()
+        run_job_release = threading.Event()
+
+        def slow_run_job(job):
+            run_job_started.set()
+            assert run_job_release.wait(timeout=5.0), "test harness did not release slow_run_job"
+            return True, "output", "response", None
+
+        fake_job = {
+            "id": "slow-job",
+            "name": "slow",
+            "prompt": "hello",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "*/5 * * * *"},
+        }
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[fake_job]), \
+             patch("cron.scheduler.reserve_for_dispatch"), \
+             patch("cron.scheduler.run_job", side_effect=slow_run_job), \
+             patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler._deliver_result"):
+            from cron.scheduler import tick
+
+            start = time.monotonic()
+            executed = tick(verbose=False)
+            tick_elapsed = time.monotonic() - start
+
+            try:
+                # tick should have returned very quickly — certainly before
+                # the worker finishes, since the worker is still blocked on
+                # the release event.
+                assert tick_elapsed < 1.0, (
+                    f"tick took {tick_elapsed:.2f}s — head-of-line blocking regressed"
+                )
+                assert executed == 1
+                # Worker should have started even though tick returned.
+                assert run_job_started.wait(timeout=2.0), "worker thread never started"
+            finally:
+                # Always release the worker so the pool doesn't leak a blocked thread.
+                run_job_release.set()
+
+    def test_once_job_not_redispatched_while_worker_running(self, tmp_path):
+        """A force-fired once-job must NOT be re-dispatched by a subsequent
+        tick while the first worker is still executing.
+
+        This is the critical fix that #13021 left open: advance_next_run()
+        no-ops on `kind == "once"`, so once-jobs remained due in jobs.json
+        until the worker reached mark_job_run (3-10 min later for LLM
+        agents).  Any tick in that window re-dispatched the same once-job.
+
+        After the fix, reserve_for_dispatch() sets in_flight_until for
+        once-jobs before the worker is submitted, and get_due_jobs() filters
+        out jobs with a live lease.
+        """
+        import threading
+        from cron.jobs import create_job, load_jobs, save_jobs
+
+        # Real jobs.json (isolated via the fixture).  Create a once-job that
+        # is already due.
+        job = create_job(prompt="Mendi probe", schedule="30m")
+        jobs = load_jobs()
+        from datetime import datetime as _dt, timedelta as _td
+        past = (_dt.now() - _td(minutes=5)).isoformat()
+        for j in jobs:
+            j["next_run_at"] = past
+        save_jobs(jobs)
+
+        run_job_start_count = {"n": 0}
+        run_job_release = threading.Event()
+
+        def slow_run_job(job_arg):
+            run_job_start_count["n"] += 1
+            # Hold the first worker open so we can fire a second tick while
+            # it's still "running".
+            assert run_job_release.wait(timeout=5.0)
+            return True, "output", "response", None
+
+        try:
+            with patch("cron.scheduler.run_job", side_effect=slow_run_job), \
+                 patch("cron.scheduler._deliver_result"), \
+                 patch("cron.scheduler.save_job_output", return_value=tmp_path / "out.md"):
+                from cron.scheduler import tick
+
+                first_dispatched = tick(verbose=False)
+                # Second tick fires BEFORE the first worker completes.
+                second_dispatched = tick(verbose=False)
+
+                assert first_dispatched == 1, "first tick should dispatch the due once-job"
+                assert second_dispatched == 0, (
+                    "second tick must NOT re-dispatch the once-job while the "
+                    "first worker is still running — in_flight_until lease "
+                    "should exclude it. Got second_dispatched=%d."
+                    % second_dispatched
+                )
+
+                # Release the worker and let the pool drain before the test
+                # exits so we don't leak a blocked thread.
+                run_job_release.set()
+                tick(verbose=False, _wait_for_completion=True)
+        finally:
+            run_job_release.set()
+
+        assert run_job_start_count["n"] == 1, (
+            "run_job must have been called exactly once — re-dispatch "
+            "regression. Calls: %d" % run_job_start_count["n"]
+        )
