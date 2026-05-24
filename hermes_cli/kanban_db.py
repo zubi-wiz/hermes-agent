@@ -865,8 +865,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id           TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
-
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
@@ -1166,18 +1164,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
     if "session_id" not in cols:
-        # Originating agent/chat session id, populated when the task is
-        # created from within an agent loop that propagated
-        # ``HERMES_SESSION_ID`` (e.g. ACP). NULL on legacy rows and on any
-        # creation path that doesn't set the env var (CLI, dashboard).
-        # Index keeps per-session list queries cheap.
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
-            "ON tasks(session_id)"
-        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
+        "ON tasks(session_id)"
+    )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
